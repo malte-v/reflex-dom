@@ -106,6 +106,9 @@ module Reflex.Dom.Builder.Immediate
   , WindowConfig (..)
   , Window (..)
   , wrapWindow
+  -- * Attributes for controlling hydration
+  , hydratableAttribute
+  , skipHydrationAttribute
   -- * Internal
   , traverseDMapWithKeyWithAdjust'
   , hoistTraverseWithKeyWithAdjust
@@ -136,11 +139,12 @@ import Data.IntMap.Strict (IntMap)
 import Data.Maybe
 import Data.Monoid ((<>))
 import Data.Some (Some(..))
+import Data.String (IsString)
 import Data.Text (Text)
 import Foreign.JavaScript.Internal.Utils
 import Foreign.JavaScript.TH
 import GHCJS.DOM.Document (Document, createDocumentFragment, createElement, createElementNS, createTextNode, createComment)
-import GHCJS.DOM.Element (getScrollTop, removeAttribute, removeAttributeNS, setAttribute, setAttributeNS, hasAttribute, hasAttributeNS)
+import GHCJS.DOM.Element (getScrollTop, removeAttribute, removeAttributeNS, setAttribute, setAttributeNS, hasAttribute)
 import GHCJS.DOM.EventM (EventM, event, on)
 import GHCJS.DOM.KeyboardEvent as KeyboardEvent
 import GHCJS.DOM.MouseEvent
@@ -191,6 +195,7 @@ import qualified GHCJS.DOM.TouchEvent as TouchEvent
 import qualified GHCJS.DOM.TouchList as TouchList
 import qualified GHCJS.DOM.Types as DOM
 import qualified GHCJS.DOM.Window as Window
+import qualified GHCJS.DOM.WheelEvent as WheelEvent
 import qualified Reflex.Patch.DMap as PatchDMap
 import qualified Reflex.Patch.DMapWithMove as PatchDMapWithMove
 import qualified Reflex.Patch.MapWithMove as PatchMapWithMove
@@ -309,8 +314,7 @@ addHydrationStepWithSetup :: (Adjustable t m, MonadIO m) => m a -> (a -> Hydrati
 addHydrationStepWithSetup setup f = getHydrationMode >>= \case
   HydrationMode_Immediate -> pure ()
   HydrationMode_Hydrating -> do
-    switchover <- HydrationDomBuilderT $ asks _hydrationDomBuilderEnv_switchover
-    (s, _) <- lift $ runWithReplace setup $ return () <$ switchover
+    s <- lift setup
     addHydrationStep (f s)
 
 -- | Add a hydration step
@@ -733,6 +737,14 @@ elementInternal elementTag cfg child = getHydrationMode >>= \case
   -> HydrationDomBuilderT HydrationDomSpace DomTimeline HydrationM (Element er HydrationDomSpace DomTimeline, a)
   #-}
 
+-- | An attribute which causes hydration to skip over an element completely.
+skipHydrationAttribute :: IsString s => s
+skipHydrationAttribute = "data-hydration-skip"
+
+-- | An attribute which signals that an element should be hydrated.
+hydratableAttribute :: IsString s => s
+hydratableAttribute = "data-ssr"
+
 {-# INLINE hydrateElement #-}
 hydrateElement
   :: forall er t m a. (MonadJSM m, Reflex t, MonadReflexCreateTrigger t m, MonadFix m, PrimState m ~ PrimState JSM, PrimMonad m)
@@ -754,11 +766,15 @@ hydrateElement elementTag cfg child = do
         }
   result <- HydrationDomBuilderT $ lift $ runReaderT (unHydrationDomBuilderT child) env'
   wrapResult <- liftIO newEmptyMVar
-  let skipAttr = "data-hydration-skip" :: DOM.JSString
-      hasSkipAttribute :: DOM.Element -> HydrationRunnerT t m Bool
-      hasSkipAttribute e = case cfg ^. namespace of
-        Nothing -> hasAttribute e skipAttr
-        Just ns -> hasAttributeNS e (Just ns) skipAttr
+  let -- Determine if we should skip an element. We currently skip elements for
+      -- two reasons:
+      -- 1) it was not produced by a static builder which supports hydration
+      -- 2) it is explicitly marked to be skipped
+      shouldSkip :: DOM.Element -> HydrationRunnerT t m Bool
+      shouldSkip e = do
+        skip <- hasAttribute e (skipHydrationAttribute :: DOM.JSString)
+        hydratable <- hasAttribute e (hydratableAttribute :: DOM.JSString)
+        pure $ skip || not hydratable
   childDom <- liftIO $ readIORef childDelayedRef
   let rawCfg = extractRawElementConfig cfg
   doc <- askDocument
@@ -773,8 +789,8 @@ hydrateElement elementTag cfg child = do
             pure e
           Just node -> DOM.castTo DOM.Element node >>= \case
             Nothing -> go (Just node) -- this node is not an element, skip
-            Just e -> hasSkipAttribute e >>= \case
-              True -> go (Just node) -- this element is explicitly marked for being skipped by hydration
+            Just e -> shouldSkip e >>= \case
+              True -> go (Just node) -- this element should be skipped by hydration
               False -> do
                 t <- Element.getTagName e
                 -- TODO: check attributes?
@@ -1260,8 +1276,8 @@ hydrateComment doc t mSetContents = do
 skipToAndReplaceComment
   :: (MonadJSM m, Reflex t, MonadFix m, Adjustable t m, MonadHold t m, RawDocument (DomBuilderSpace (HydrationDomBuilderT s t m)) ~ Document, PrimState m ~ PrimState JSM, PrimMonad m)
   => Text
-  -> IORef Text
-  -> HydrationDomBuilderT s t m (HydrationRunnerT t m (), IORef DOM.Text, IORef Text)
+  -> IORef (Maybe Text)
+  -> HydrationDomBuilderT s t m (HydrationRunnerT t m (), IORef DOM.Text, IORef (Maybe Text))
 skipToAndReplaceComment prefix key0Ref = getHydrationMode >>= \case
   HydrationMode_Immediate -> do
     -- If we're in immediate mode, we don't try to replace an existing comment,
@@ -1269,40 +1285,47 @@ skipToAndReplaceComment prefix key0Ref = getHydrationMode >>= \case
     t <- textNodeImmediate $ TextNodeConfig ("" :: Text) Nothing
     append $ toNode t
     textNodeRef <- liftIO $ newIORef t
-    keyRef <- liftIO $ newIORef ""
+    keyRef <- liftIO $ newIORef Nothing
     pure (pure (), textNodeRef, keyRef)
   HydrationMode_Hydrating -> do
     doc <- askDocument
     textNodeRef <- liftIO $ newIORef $ error "textNodeRef not yet initialized"
     keyRef <- liftIO $ newIORef $ error "keyRef not yet initialized"
-    let go key0 mLastNode = do
-          parent <- askParent
-          node <- maybe (Node.getFirstChildUnchecked parent) Node.getNextSiblingUnchecked mLastNode
-          DOM.castTo DOM.Comment node >>= \case
+    let
+      go Nothing _ = do
+        tn <- createTextNode doc ("" :: Text)
+        insertAfterPreviousNode tn
+        HydrationRunnerT $ modify' $ \s -> s { _hydrationState_failed = True }
+        pure (tn, Nothing)
+      go (Just key0) mLastNode = do
+        parent <- askParent
+        maybe (Node.getFirstChild parent) Node.getNextSibling mLastNode >>= \case
+          Nothing -> go Nothing Nothing
+          Just node -> DOM.castTo DOM.Comment node >>= \case
             Just comment -> do
-              commentText <- Node.getTextContentUnchecked comment
-              case T.stripPrefix (prefix <> key0) commentText of
+              commentText <- fromMaybe (error "Cannot get text content of comment node") <$> Node.getTextContent comment
+              case T.stripPrefix (prefix <> key0) commentText of -- 'key0' may be @""@ in which case we're just finding the actual key; TODO: Don't be clever.
                 Just key -> do
                   -- Replace the comment with an (invisible) text node
                   tn <- createTextNode doc ("" :: Text)
                   Node.replaceChild_ parent tn comment
-                  pure (tn, key)
+                  pure (tn, Just key)
                 Nothing -> do
-                  go key0 (Just node)
+                  go (Just key0) (Just node)
             Nothing -> do
-              go key0 (Just node)
-        switchComment = do
-          key0 <- liftIO $ readIORef key0Ref
-          (tn, key) <- go key0 =<< getPreviousNode
-          setPreviousNode $ Just $ toNode tn
-          liftIO $ do
-            writeIORef textNodeRef tn
-            writeIORef keyRef key
+              go (Just key0) (Just node)
+      switchComment = do
+        key0 <- liftIO $ readIORef key0Ref
+        (tn, key) <- go key0 =<< getPreviousNode
+        setPreviousNode $ Just $ toNode tn
+        liftIO $ do
+          writeIORef textNodeRef tn
+          writeIORef keyRef key
     pure (switchComment, textNodeRef, keyRef)
 
 {-# INLINABLE skipToReplaceStart #-}
 skipToReplaceStart :: (MonadJSM m, Reflex t, MonadFix m, Adjustable t m, MonadHold t m, RawDocument (DomBuilderSpace (HydrationDomBuilderT s t m)) ~ Document, PrimState m ~ PrimState JSM, PrimMonad m) => HydrationDomBuilderT s t m (HydrationRunnerT t m (), IORef DOM.Text, IORef Text)
-skipToReplaceStart = skipToAndReplaceComment "replace-start" =<< liftIO (newIORef "")
+skipToReplaceStart = skipToAndReplaceComment "replace-start" =<< liftIO (newIORef $ Just "") -- TODO: Don't rely on clever usage @""@ to make this work.
 
 {-# INLINABLE skipToReplaceEnd #-}
 skipToReplaceEnd :: (MonadJSM m, Reflex t, MonadFix m, Adjustable t m, MonadHold t m, RawDocument (DomBuilderSpace (HydrationDomBuilderT s t m)) ~ Document, PrimState m ~ PrimState JSM, PrimMonad m) => IORef Text -> HydrationDomBuilderT s t m (HydrationRunnerT t m (), IORef DOM.Text)
@@ -2243,7 +2266,7 @@ defaultDomEventHandler e evt = fmap (Just . EventResult) $ case evt of
   Touchend -> getTouchEvent
   Touchcancel -> getTouchEvent
   Mousewheel -> return ()
-  Wheel -> return ()
+  Wheel -> getWheelEvent
 
 {-# INLINABLE defaultDomWindowEventHandler #-}
 defaultDomWindowEventHandler :: DOM.Window -> EventName en -> EventM DOM.Window (EventType en) (Maybe (EventResult en))
@@ -2293,7 +2316,7 @@ defaultDomWindowEventHandler w evt = fmap (Just . EventResult) $ case evt of
   Touchend -> getTouchEvent
   Touchcancel -> getTouchEvent
   Mousewheel -> return ()
-  Wheel -> return ()
+  Wheel -> getWheelEvent
 
 {-# INLINABLE withIsEvent #-}
 withIsEvent :: EventName en -> (IsEvent (EventType en) => r) -> r
@@ -2600,6 +2623,26 @@ getTouchEvent = do
     , _touchEventResult_shiftKey = shiftKey
     , _touchEventResult_targetTouches = targetTouches
     , _touchEventResult_touches = touches
+    }
+
+{-# INLINABLE getWheelEvent #-}
+getWheelEvent :: EventM e WheelEvent WheelEventResult
+getWheelEvent = do
+  e <- event
+  dx :: Double <- WheelEvent.getDeltaX e
+  dy :: Double <- WheelEvent.getDeltaY e
+  dz :: Double <- WheelEvent.getDeltaZ e
+  deltaMode :: Word <- WheelEvent.getDeltaMode e
+  return $ WheelEventResult
+    { _wheelEventResult_deltaX = dx
+    , _wheelEventResult_deltaY = dy
+    , _wheelEventResult_deltaZ = dz
+    , _wheelEventResult_deltaMode = case deltaMode of
+        0 -> DeltaPixel
+        1 -> DeltaLine
+        2 -> DeltaPage
+        -- See https://developer.mozilla.org/en-US/docs/Web/API/WheelEvent/deltaMode
+        _ -> error "getWheelEvent: impossible encoding"
     }
 
 instance MonadSample t m => MonadSample t (HydrationDomBuilderT s t m) where
