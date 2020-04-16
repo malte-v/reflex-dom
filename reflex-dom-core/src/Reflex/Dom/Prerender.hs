@@ -266,15 +266,15 @@ instance (Prerender js t m, Monad m, Reflex t, Semigroup w) => Prerender js t (E
 instance (Prerender js t m, MonadFix m, Reflex t, PrimState (Client m) ~ PrimState m) => Prerender js t (RequesterT t request response m) where
   type Client (RequesterT t request response m) = RequesterT t request response (Client m)
   prerender (RequesterT (RequesterInternalT server)) (RequesterT (RequesterInternalT client)) = RequesterT $ RequesterInternalT $ prerender server client
-  # prerender server client = mdo
-  #   let fannedResponses = fanInt responses
-  #       withFannedResponses :: forall m' a. Monad m' => RequesterT t request response m' a -> Int -> m' (a, Event t (IntMap (RequesterData request)))
-  #       withFannedResponses w selector = do
-  #         (x, e) <- runRequesterT w (selectInt fannedResponses selector)
-  #         pure (x, fmapCheap (IntMap.singleton selector) e)
-  #   (result, requestsDyn) <- fmap splitDynPure $ lift $ prerender (withFannedResponses server 0) (withFannedResponses client 1)
-  #   responses <- fmap (fmapCheap unMultiEntry) $ requesting' $ fmapCheap multiEntry $ switchPromptlyDyn requestsDyn
-  #   return result
+  -- prerender server client = mdo
+  --   let fannedResponses = fanInt responses
+  --       withFannedResponses :: forall m' a. Monad m' => RequesterT t request response m' a -> Int -> m' (a, Event t (IntMap (RequesterData request)))
+  --       withFannedResponses w selector = do
+  --         (x, e) <- runRequesterT w (selectInt fannedResponses selector)
+  --         pure (x, fmapCheap (IntMap.singleton selector) e)
+  --   (result, requestsDyn) <- fmap splitDynPure $ lift $ prerender (withFannedResponses server 0) (withFannedResponses client 1)
+  --   responses <- fmap (fmapCheap unMultiEntry) $ requesting' $ fmapCheap multiEntry $ switchPromptlyDyn requestsDyn
+  --   return result
 
 instance (Prerender js t m, Monad m, Reflex t, MonadFix m, Group q, Additive q, Query q, Eq q) => Prerender js t (QueryT t q m) where
   type Client (QueryT t q m) = QueryT t q (Client m)
