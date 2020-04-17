@@ -82,8 +82,8 @@ import Test.Util.UnshareNetwork
 -- ORPHAN: https://github.com/kallisti-dev/hs-webdriver/pull/167
 deriving instance MonadMask WD
 
-chromium :: FilePath
-chromium = $(staticWhich "chromium")
+-- chromium :: FilePath
+-- chromium = $(staticWhich "chromium")
 
 seleniumPort, jsaddlePort :: PortNumber
 seleniumPort = 8000
@@ -136,7 +136,7 @@ main = do
   isHeadless <- (== Nothing) <$> lookupEnv "NO_HEADLESS"
   withSandboxedChromeFlags isHeadless $ \chromeFlags -> do
     withSeleniumServer $ \selenium -> do
-      let browserPath = T.strip $ T.pack chromium
+      let browserPath = T.strip $ T.pack ""
       when (T.null browserPath) $ fail "No browser found"
       withDebugging <- isNothing <$> lookupEnv "NO_DEBUG"
       let wdConfig = WD.defaultConfig { WD.wdPort = fromIntegral $ _selenium_portNumber selenium }
